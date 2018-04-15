@@ -53,14 +53,94 @@ void setup_adc() {
   ADC->ADC_CR |= ADC_CR_START; //start waiting for trigger.
 }
 
+// Duration of a single chirp
+const double chirp_duration = 2E-3;
+
+// Frequency to trigger conversions at (bound at ~1.666E6)
+const int sample_freq = 2E6;
+
+// Number of samples per buffer provided to DAC
+// Should not exceed 100
+const int samples_per_block = 100;
+// Total number of samples per waveform
+// Must be multiple of samples_per_block
+const int num_samples = 3200;
+// Number of separate buffers per waveform 
+const int num_blocks = num_samples/samples_per_block;
+
+uint16_t waveform[num_samples];
+
+// Generate the waveform for an enveloped, linear cosine sweep
+void generate_chirp()
+{ 
+  // Duration of chirp
+  const double t1 = chirp_duration;
+
+  // Phase shift (rads)
+  const double phi = 0;
+
+  // Initial frequency (Hz)
+  const double f0 = 5E3;
+  // Final frequency (Hz)
+  const double f1 = 105E3;
+
+  // "Chirpyness" or rate of frequency change
+  const double k = (f1 - f0) / t1;
+  
+  for (int i = 0; i < num_samples; ++i)
+  {
+    double t = t1 * ((double)i / num_samples);
+    // Create a chirp from the frequency f(t) = f0 + kt
+    double chirp = cos(phi + 2*PI * (f0*t + k/2 * t*t));
+    // Create a Hanning window to envelope the chirp
+    double window = 0.5 * (1 - cos(2*PI * i/(num_samples - 1)));
+    // Move the signal across a difference reference
+    waveform[i] = 4095/2 + 4095/2 * (chirp * window);
+  }
+}
+
+void setup_dac() {
+  pmc_enable_periph_clk(DACC_INTERFACE_ID);
+  
+  dacc_reset(DACC);
+  dacc_set_transfer_mode(DACC, 0);
+  dacc_set_power_save(DACC, 0, 1);
+  
+  dacc_set_analog_control(DACC, DACC_ACR_IBCTLCH0(0x02) | DACC_ACR_IBCTLCH1(0x02) | DACC_ACR_IBCTLDACCORE(0x01));
+  dacc_set_trigger(DACC, 1);
+
+  dacc_set_channel_selection(DACC, 0);
+  dacc_enable_channel(DACC, 0);
+
+  NVIC_DisableIRQ(DACC_IRQn);
+  NVIC_ClearPendingIRQ(DACC_IRQn);
+  NVIC_EnableIRQ(DACC_IRQn);
+
+  // Enable PDC TX requests
+  DACC->DACC_PTCR = DACC_PTCR_TXTEN;
+
+  dacc_enable_interrupt(DACC, DACC_IER_ENDTX);
+  
+  DACC->DACC_TPR = (uint32_t)(waveform);      // DMA buffer
+  DACC->DACC_TCR = samples_per_block;
+  if (num_blocks > 1) {
+    DACC->DACC_TNPR = (uint32_t)(waveform + samples_per_block);
+    DACC->DACC_TNCR = samples_per_block;
+  }
+}
+
 void setup() {
   Serial.begin(115200);
-  
+
+  // Enable output on B ports
   REG_PIOB_OWER = 0xFFFFFFFF;
   REG_PIOB_OER =  0xFFFFFFFF;
 
+  generate_chirp();
+
   pmc_set_writeprotect(false);
 
+  setup_dac();
   setup_adc();
   setup_timer();
 
@@ -72,12 +152,14 @@ void TC0_Handler() {
 
   static int i = 0;
 
+  /*
   if (i == 400) {
     adc_stop(ADC);
     TC_Stop(TC0, 0);
 
     dataReady = true;
   }
+  */
 
   i++;
 
@@ -97,19 +179,12 @@ void ADC_Handler() {
   }
 }
 
-void loop() {
-  if (dataReady) {
-    for (int n = 0; n < NUMBER_OF_BUFFERS; ++n) {
-      for (int m = 0; m < BUFFER_SIZE; ++m) {
-        Serial.print(n);
-        Serial.print('\t');
-        Serial.print(m);
-        Serial.print('\t');
-        Serial.println(adcBuffer[n][m]);
-        Serial.flush();
-      }
-    }
-
-    dataReady = false;
+volatile uint16_t block_index = 0;
+void DACC_Handler() {
+  if (DACC->DACC_ISR & DACC_ISR_ENDTX) {
+    DACC->DACC_TNPR =  (uint32_t)(waveform + samples_per_block * (++block_index % num_blocks));
+    DACC->DACC_TNCR =  samples_per_block;
   }
 }
+
+void loop() { }
